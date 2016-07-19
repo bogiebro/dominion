@@ -15,10 +15,11 @@ import qualified Data.Vector as V
 import Data.Vector (Vector)
 import qualified Data.Map as M
 import Data.Map (Map)
+import Data.Monoid
 
 -- Note: these type signatures get really hairy. 
 -- A lot of this would get simplified if I switched from using mtl
--- to using extendible-effects. Worth trying?
+-- to using extendible-effects. I'll make a branch with this behavior.
 
 -- Game state
 data GameState = GameState {
@@ -81,7 +82,7 @@ game :: (Learner (t (Rand StdGen)), MonadState GameState (t (Rand StdGen)),
 game cardDist players = runMaybeT gameMonad >> gets score where
   gameMonad = forever $ checkDone >> lift turn >>
     replicateM_ (players - 1) (checkDone >> lift playOpponent)
-  startDeck = mkDist [(snd $ cardNames M.! "Copper", 7/10), (snd $ cardNames M.! "Estate", 3/10)]
+  startDeck = mkDist [(snd $ cardNames M.! "Copper", 7), (snd $ cardNames M.! "Estate", 3)]
   initSt = GameState {
     _deck = startDeck,
     _discards = nullDist,
@@ -97,11 +98,16 @@ game cardDist players = runMaybeT gameMonad >> gets score where
 
 -- Check if a game is finished
 checkDone :: GamePlayer m => MaybeT m ()
-checkDone = undefined
+checkDone = do
+  allGone <- uses needEliminated (0 ==)
+  provincesGone <- uses remaining ((0 ==) . getDist (snd (cardNames M.! "Province")))
+  guard (allGone || provincesGone)
 
 -- Score a completed game
 score :: GameState -> Int
-score = undefined
+score g = scoreCards (_deck g <> _discards g) - scoreCards (_opDeck g <> _opDiscards g) where
+  scoreCards :: Dist -> Int
+  scoreCards c = getSum $ distSum (Sum . flip points c . (standardDeck V.!)) c
 
 -- Move `i` cards from deck to hand
 plusCard :: Int -> PlayAction ()
