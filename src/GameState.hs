@@ -1,12 +1,12 @@
-{-# LANGUAGE TemplateHaskell, ExistentialQuantification, OverloadedStrings,
-    RankNTypes, KindSignatures, TypeSynonymInstances, FlexibleInstances,
-    MultiParamTypeClasses #-}
+{-# LANGUAGE TemplateHaskell, OverloadedStrings, GeneralizedNewtypeDeriving,
+    RankNTypes, FlexibleContexts, FlexibleInstances, MultiParamTypeClasses,
+    UndecidableInstances #-}
 module GameState where
 import Control.Lens
 import Control.Monad.State
+import Control.Monad.Reader
 import Data.Text (Text)
 import Control.Monad.Random
-
 import Dist
 
 -- Game state
@@ -19,45 +19,47 @@ data GameState = GameState {
   _buys :: Int,
   _actions :: Int,
   _hand :: [Card] 
-} 
+}
 
 -- Monad that makes use of machine learning
 class Monad m => Learner m where
   calcPayoff :: GameState -> m Int
 
--- A component of multi-turn gameplay, using training monad t and play monad m
-type Player t (m :: * -> *) = StateT GameState (t m)
-
--- Players associated with cards; existentially qualified over Learner monad
-data PlayAction a = forall t m. P (GamePlayer m, Learner (t m)) => PlayAction {
-  applyAction :: Player t m a
-}
-
--- Pretty sure I can get rid of these somehow
-instance Monad PlayAction where
-  return = PlayAction . return
-  (PlayAction m) >>= f = PlayAction (m >>= f)
-
-instance MonadState GameState PlayAction where
-  get = PlayAction get
-  put s = PlayAction $ put s
-  state f = PlayAction $ state f
-  
-
 -- Environment in which to play the game
-class GamePlayer (m :: * -> *) where
-  drawCard :: Player t m Card
-  playOpponent :: Learner (t m) => Player t m ()
+class Monad m => GamePlayer m where
+  drawCard :: m Card
+  playOpponent :: m ()
 
--- Play environment which draws cards by sampling
-instance GamePlayer (Rand StdGen) where
+-- Play environment which draws cards by sampling a payoff function
+newtype SimT m a = SimT (m a) deriving (Functor, Applicative, Monad)
+
+instance MonadTrans SimT where lift = SimT
+
+instance (Monad m, MonadRandom m, Learner m) => GamePlayer (SimT m) where
   drawCard = undefined
   playOpponent = undefined
 
--- Play environment which draws cards by asking the user
-instance GamePlayer IO where
+instance MonadState s m => MonadState s (SimT m) where
+    get = lift get
+    put = lift . put
+    state = lift . state
+
+-- Play enviroment which draws cards by asking the user
+newtype InteractT m a = InteractT (m a) deriving (Functor, Applicative, Monad)
+
+instance MonadTrans InteractT where lift = InteractT
+
+instance MonadIO m => GamePlayer (InteractT m) where
   drawCard = undefined
   playOpponent = undefined
+
+instance MonadState s m => MonadState s (InteractT m) where
+    get = lift get
+    put = lift . put
+    state = lift . state
+
+-- Gameplay component
+type PlayAction a = forall m. (GamePlayer m, MonadState GameState m) => m a
 
 -- Categories of cards, often for determining what's legal to draw
 data CardType = Victory | Treasure | Action deriving (Eq)
@@ -92,17 +94,17 @@ duchy = (card "Duchy" 5) {points = const 3, cardType = Victory}
 province = (card "Province" 8) {points = const 6, cardType = Victory}
 
 -- Which moves are legal for a given State?
-legalMoves :: GameState -> [PlayAction ()]
+legalMoves :: MonadState GameState m => GameState -> [m ()]
 legalMoves = undefined
 
 -- Play out a turn for the program
-turn :: (GamePlayer m, Learner (t m)) => Player t m ()
+turn :: PlayAction ()
 turn = undefined
 
 -- Play out a game by random simulation, starting with the given cards available
-game :: Dist -> Player t (Rand StdGen) ()
+game :: (Learner (t (Rand StdGen))) => Dist -> SimT (t (Rand StdGen)) ()
 game = undefined
 
 -- Move `i` cards from deck to hand
 plusCard :: Int -> PlayAction ()
-plusCard i = PlayAction $ replicateM_ i (drawCard >>= \d-> hand %= (d:))
+plusCard i = replicateM_ i (drawCard >>= \d-> hand %= (d:))
