@@ -1,10 +1,12 @@
 module Dist (Dist(..), mkDist, choose, addDist, removeDist) where
+import Control.Monad.Random
 
 -- obviously we'll need a real type
 data Dist = Dist ()
 
 -- Make a distribution, given a list matching value to frequency
-mkDist :: [(Int, Int)] -> CardDist
+mkDist :: [(Int, Int)] -> Dist
+mkDist = undefined
 
 -- Draw a value from this distribution. O(1)
 choose :: Dist -> Rand StdGen (Int, Dist)

@@ -16,9 +16,8 @@ cabal-version:       >=1.10
 library
   hs-source-dirs:      src
   exposed-modules:     Cards, Dist, GameState, MonteCarlo, Train
-  build-depends:       base >= 4.7 && < 5, lens, MonadRandom, mmorph, text, vector
+  build-depends:       base >= 4.7 && < 5, mtl, lens, MonadRandom, text, vector
   default-language:    Haskell2010
-  extensions:          OverloadedStrings, TemplateHaskell
 
 executable dominion
   hs-source-dirs:      app
