@@ -1,52 +1,49 @@
-{-# LANGUAGE TemplateHaskell, GeneralizedNewtypeDeriving, OverloadedLists,
-    RankNTypes, FlexibleContexts, FlexibleInstances, MultiParamTypeClasses,
-    ParallelListComp, UndecidableInstances #-}
+{-# LANGUAGE TemplateHaskell, DataKinds, ParallelListComp,
+  OverloadedLists, OverloadedStrings #-}
 module GameState where
 import Control.Lens
-import Control.Monad.State
+import Control.Monad.State.Strict
 import Control.Monad.Reader
+import Control.Monad.Writer
 import Control.Monad.Trans.Maybe
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
-import Control.Monad.Random
 import Dist
 import qualified Data.Vector as V
+import qualified Data.Vector.Unboxed as U
 import Data.Vector (Vector)
 import qualified Data.Map as M
 import Data.Map (Map)
 import Data.Monoid
 
--- Note: these type signatures get really hairy. 
--- A lot of this would get simplified if I switched from using mtl
--- to using extendible-effects. I'll make a branch with this behavior.
+-- We need to have a gamestate for each opponent
+-- And use the strongest opponent's state as the true opponent.
 
 -- Game state
 data GameState = GameState {
   _deck :: Dist,
-  _discards :: Dist,
   _opDeck :: Dist,
-  _opDiscards :: Dist,
-  _remaining :: Dist,
+  _remaining :: U.Vector CardId,
   _needEliminated :: Int,
   _money :: Int,
   _buys :: Int,
   _actions :: Int,
-  _hand :: [Card] 
+  _hand :: [Card],
+  _myTurn :: Bool
 }
 
--- Monad that makes use of machine learning
-class Monad m => Learner m where
-  calcPayoff :: GameState -> m Int
-
--- Environment in which to play the game
-class (Monad m, MonadState GameState m) => GamePlayer m where
-  drawCard :: m Card
-  harmOpponent :: m Bool
-  playOpponent :: m ()
+-- State affecting how we transition GameState
+data PlayState = PlayState {
+  _updateWeights :: Bool, 
+  _simulated :: Bool
+}
 
 -- Gameplay component
-type PlayAction a = forall m. (GamePlayer m) => m a
+type GameAction = ReaderT PlayState ((WriterT (First Text) (MaybeT IO)))
+
+-- Gameplay component, in a particular running context
+type PlayAction = StateT GameState GameAction
 
 -- Categories of cards, often for determining what's legal to draw
 data CardType = Victory | Treasure | Action deriving (Eq)
@@ -59,59 +56,84 @@ data Card = Card {
   cost :: Int,
   more :: Int, 
   cardType :: CardType,
-  defense :: Bool
+  defense :: Bool,
+  initAmt :: Int
 }
 
 makeLenses ''GameState
+makeLenses ''PlayState
 
 -- Default card constructor
 card :: Text -> Int -> Card
-card n c = Card n (return ()) (const 0) c 0 Action False
+card n c = Card n (return ()) (const 0) c 0 Action False 10
 
 -- Which moves are legal for a given State?
-legalMoves :: MonadState GameState m => GameState -> [m ()]
+legalMoves :: GameState -> [PlayAction ()]
 legalMoves = undefined
+
+-- Should I simulate the PlayAction behavior?
+simulate :: PlayAction ()
+simulate = ((||) <$> use myTurn <*> view simulated) >>= guard
 
 -- Play out a turn for the program
 turn :: PlayAction ()
-turn = undefined
+turn = checkDone >> ((simulate >> simAction >> simBuy) `mplus` liveAction >> liveBuy) where
+  liveAction = do
+    t <- liftIO (T.putStrLn "Play a card:" >> T.getLine)
+    when (not (T.null t)) $ liftIO (parseCard t) >>= \(c, i)->
+      opDeck %= discard i >> action c >> liveAction
+  simAction = undefined
 
--- Play out a game by random simulation, starting with the given cards available
-game :: (Learner (t (Rand StdGen)), MonadState GameState (t (Rand StdGen)),
-        MonadRandom (t (Rand StdGen))) => Dist -> Int -> SimT (t (Rand StdGen)) Int
-game cardDist players = runMaybeT gameMonad >> gets score where
-  gameMonad = forever $ checkDone >> lift turn >>
-    replicateM_ (players - 1) (checkDone >> lift playOpponent)
+  liveBuy = do
+    t <- liftIO (T.putStrLn "Buy a card:" >> T.getLine)
+    when (not (T.null t)) $ liftIO (parseCard t) >>= \(c, i)->
+      opDeck %= addDiscard i >> liveBuy
+  simBuy = undefined
+
+-- Play out a game, starting with the given cards available
+game :: U.Vector CardId -> Int -> GameAction Int
+game startDist players = score <$> execStateT gameMonad ini where
+  gameMonad = forever $ do
+    myTurn .= True >> turn
+    myTurn .= False >> replicateM_ (players - 1) turn
   startDeck = mkDist [(snd $ cardNames M.! "Copper", 7), (snd $ cardNames M.! "Estate", 3)]
-  initSt = GameState {
+  ini = GameState {
     _deck = startDeck,
-    _discards = nullDist,
     _opDeck = startDeck,
-    _opDiscards = nullDist,
-    _remaining = cardDist,
+    _remaining = startDist,
     _needEliminated = 3,
     _money = 0,
     _buys = 0,
     _actions = 0,
-    _hand = []
+    _hand = [],
+    _myTurn = True
   }
 
 -- Check if a game is finished
-checkDone :: GamePlayer m => MaybeT m ()
+checkDone :: PlayAction ()
 checkDone = do
   allGone <- uses needEliminated (0 ==)
-  provincesGone <- uses remaining ((0 ==) . getDist (snd (cardNames M.! "Province")))
+  let provinceIdx = fromIntegral (snd (cardNames M.! "Province"))
+  provincesGone <- uses remaining ((0 ==) . (U.! provinceIdx))
   guard (allGone || provincesGone)
 
 -- Score a completed game
 score :: GameState -> Int
+score = undefined
+{-
 score g = scoreCards (_deck g <> _discards g) - scoreCards (_opDeck g <> _opDiscards g) where
   scoreCards :: Dist -> Int
   scoreCards c = getSum $ distSum (Sum . flip points c . (standardDeck V.!)) c
+-}
 
 -- Move `i` cards from deck to hand
 plusCard :: Int -> PlayAction ()
-plusCard i = replicateM_ i (drawCard >>= \d-> hand %= (d:))
+plusCard i = replicateM_ i
+  (use deck >>= liftIO . draw >>= \(i, d)-> deck .= d >> hand %= (idToCard i:))
+
+-- Look up a card by id
+idToCard :: CardId -> Card
+idToCard i = standardDeck V.! fromIntegral i
 
 -- Base dominion deck (no expansions)
 standardDeck :: Vector Card
@@ -130,52 +152,16 @@ standardDeck = [
   (card "Bureacrat" 4) {action = hand %= (fst (cardNames M.! "Silver") :)},
   (card "Village" 5) {action = plusCard 1, more=1}]
 
--- Play environment which draws cards by sampling a payoff function
-newtype SimT m a = SimT (m a) deriving (Functor, Applicative, Monad)
-instance (Monad m, MonadState GameState m, MonadRandom m, Learner m) => GamePlayer (SimT m) where
-  drawCard = undefined
-  harmOpponent = undefined
-  playOpponent = undefined
-
--- Boilerplate instances
-instance MonadTrans SimT where lift = SimT
-instance MonadState s m => MonadState s (SimT m) where
-    get = lift get
-    put = lift . put
-    state = lift . state
-
--- Play enviroment which draws cards by asking the user
-newtype InteractT m a = InteractT (m a) deriving (Functor, Applicative, Monad)
-instance (MonadIO m, MonadState GameState m) => GamePlayer (InteractT m) where
-  drawCard = liftIO $ T.putStrLn "Draw a card:" >> T.getLine >>= fmap fst . parseCard
-  playOpponent = runInterpreter
-  harmOpponent = (== "y") <$> (liftIO $ T.putStrLn "Use this action on opponent?:" >> T.getLine)
-
--- Boilerplate instances
-instance MonadTrans InteractT where lift = InteractT
-instance MonadIO m => MonadIO (InteractT m) where
-    liftIO = InteractT . liftIO
-instance MonadState s m => MonadState s (InteractT m) where
-    get = lift get
-    put = lift . put
-    state = lift . state
-
 -- Index of deck by card name
-cardNames :: Map Text (Card, Int)
+cardNames :: Map Text (Card, CardId)
 cardNames = M.fromList [(name x, (x, i)) | x <- V.toList standardDeck | i <- [0..]] 
 
 -- Find a card with the given name, prompting the user to re-enter the name
 -- if there's a problem.
-parseCard :: Text -> IO (Card, Int)
+parseCard :: Text -> IO (Card, CardId)
 parseCard t = maybe err return (M.lookup t cardNames) where
   err = T.putStrLn "Invalid card. Try again:" >> T.getLine >>= parseCard
 
--- Construct a PlayAction by asking the user what to do
-runInterpreter :: (MonadIO m, MonadState GameState m) => InteractT m ()
-runInterpreter = actionPhase >> buyPhase where
-  actionPhase = liftIO (T.putStrLn "Play a card:" >> T.getLine) >>= \t ->
-    if T.null t then return () else liftIO (parseCard t) >>= \(c, i)->
-      opDiscards %= addDist i >> opDeck %= removeDist i >> action c >> actionPhase 
-  buyPhase = liftIO (T.putStrLn "Buy a card:" >> T.getLine) >>= \t ->
-    if T.null t then return () else liftIO (parseCard t) >>= \(c, i)->
-      opDiscards %= addDist i >> buyPhase
+-- Get a y/n value from the user
+getDecision :: MonadIO m => Text -> m Bool
+getDecision t = (== "y") <$> (liftIO $ T.putStrLn (t <> ": (y/n)") >> T.getLine)
