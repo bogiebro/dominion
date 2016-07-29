@@ -1,7 +1,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 module Dist (
   Dist(..), mkDist, draw, addDiscard, discard, 
-  removeTop, nullDist, getDist, distSum, CardId) where
+  removeTop, nullDist, getDist, CardId) where
 import System.Random
 import Data.Vector.Unboxed as U
 import Data.Word
@@ -28,6 +28,9 @@ cardClasses = 25
 -- Constant for total number of cards that can fit in a deck
 totalCards :: Int
 totalCards = 200
+
+deckSize :: Dist -> Int
+deckSize d = d^.discEnd
 
 -- Empty distribution on c card classes, where the total total number of cards cannot exceed n
 nullDist :: Dist
@@ -69,10 +72,6 @@ discard i d = d' where
 removeTop :: Dist -> Dist
 removeTop d = d & sample.ix(d^.discStart) .~ (d^?!sample.ix(d^.discEnd - 1))
                 & discEnd -~ 1
-
--- Like foldMap, but momomorphic
-distSum :: Monoid m => (Int -> m) -> Dist -> m 
-distSum = undefined
 
 -- Make a distribution, given a list matching value to frequency
 mkDist :: [(CardId, Int)] -> Dist

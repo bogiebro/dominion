@@ -17,9 +17,8 @@ library
   hs-source-dirs:      src
   exposed-modules:     Dist, GameState, MonteCarlo, Train
   build-depends:       base >= 4.7 && < 5, transformers, lens,
-                       random, text, vector, containers, mtl
+                       random, text, vector, containers, mtl, unix
   default-language:    Haskell2010
-  default-extensions:  OverloadedStrings
 
 executable dominion
   hs-source-dirs:      app
