@@ -6,6 +6,7 @@ import System.Random
 import Data.Vector.Unboxed as U
 import Data.Word
 import Control.Lens
+import Data.List as L
 
 -- Each class of card has an id
 type CardId = Word8
@@ -43,6 +44,10 @@ addDiscard i d = d & fresh . ix (fromIntegral i) +~ 1
                    & sample . ix (d ^. discEnd) .~ i
                    & discEnd +~ 1
 
+-- Make  distribution in the discard pile
+mkDist :: [(CardId, Int)] -> Dist
+mkDist = L.foldl (\d (c, i)-> iterate (addDiscard c) d !! i) nullDist
+
 -- Shuffle a distribution, placing the discard pile back in the deck
 shuffle :: Dist -> Dist
 shuffle d = d & discStart .~ (d^.discEnd)
@@ -72,10 +77,6 @@ discard i d = d' where
 removeTop :: Dist -> Dist
 removeTop d = d & sample.ix(d^.discStart) .~ (d^?!sample.ix(d^.discEnd - 1))
                 & discEnd -~ 1
-
--- Make a distribution, given a list matching value to frequency
-mkDist :: [(CardId, Int)] -> Dist
-mkDist = undefined
 
 -- Get the weight associated with this distribution
 getDist :: Int -> Dist -> Word8

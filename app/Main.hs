@@ -1,10 +1,13 @@
 module Main where
 import Options.Applicative
 import Data.Traversable
-import Data.Vector
+import Data.Vector as V
 import qualified Data.Text as T
 import GameState
 import MonteCarlo
+import Data.Word
+
+data Opts = Opts FilePath Int Bool (Vector Word8)
 
 main :: IO ()
 main = execParser desc >>= handle where
@@ -18,12 +21,11 @@ main = execParser desc >>= handle where
                     <> help "Whether to train the network")
                <*> parseCards
 
--- need to separate out the obvious cards (copper, silver, province, estate, etc)
-
-parseCards :: Parser (Vector Bool)
-parseCards = sequenceA $ fmap (switch . long . T.unpack . name) standardDeck 
-
-data Opts = Opts FilePath Int Bool (Vector Bool)
+parseCards :: Parser (Vector Word8)
+parseCards =
+  let cs = sequenceA $ fmap (switch . long . T.unpack . name) (unsafeDrop 6 standardDeck)
+      useCard b c = if b then initAmt c else 0
+  in V.zipWith useCard <$> fmap (V.replicate 6 True <>) cs <*> pure standardDeck
 
 handle :: Opts -> IO ()
 handle (Opts trainPath players train cards) = undefined

@@ -15,6 +15,11 @@ import qualified Data.Map as M
 import Data.Map (Map)
 import Data.Monoid
 import Data.Semigroup (Max(..))
+import Data.MemoTrie
+import Data.Word
+import Data.List
+import Data.Ord
+import System.Random
 
 -- Info for a single player
 data PlayerState = PlayerState {
@@ -26,11 +31,11 @@ data PlayerState = PlayerState {
 -- Game state
 data GameState = GameState {
   _players :: Vector PlayerState,
-  _remaining :: U.Vector CardId,
+  _remaining :: U.Vector Word8,
   _needEliminated :: Int,
-  _money :: Int,
-  _buys :: Int,
-  _actions :: Int,
+  _money :: Word8,
+  _buys :: Word8,
+  _actions :: Word8,
   _hand :: [Card],
   _turn :: Int
 }
@@ -48,6 +53,7 @@ type GameAction = ReaderT PlayState (MaybeT IO)
 type PlayAction = StateT GameState GameAction
 
 -- A move is a PlayAction, with a name for reporting it to the client
+-- It can either be playing a card, buying a card
 data Move = Move {
   moveName :: Text,
   moveAction :: PlayAction ()
@@ -63,11 +69,10 @@ data Card = Card {
   name :: Text,
   action :: PlayAction (),
   points :: Int,
-  cost :: Int,
-  more :: Int, 
+  cost :: Word8,
   cardType :: CardType,
   defense :: Bool,
-  initAmt :: Int
+  initAmt :: Word8
 }
 
 makeLenses ''PlayerState
@@ -75,22 +80,56 @@ makeLenses ''GameState
 makeLenses ''PlayState
 
 -- Default card constructor
-card :: Text -> Int -> Card
-card n c = Card n (return ()) 0 c 0 Action False 10
+card :: Text -> Word8 -> Card
+card n c = Card n (return ()) 0 c Action False 10
 
 -- Which moves are legal for a given State?
 legalMoves :: GameState -> [Move]
 legalMoves g =
   if _actions g > 0 then Move <$> (("Play " <>) . name) <*> action <$> _hand g
-  else undefined 
+  else buyCards <$> findBuys (_buys g) (_money g) 0
+
+-- Find all possible purchase sets
+findBuys :: Word8 -> Word8 -> CardId -> [[CardId]]
+findBuys = memo3 findBuys' where
+  findBuys' 0 money i = []
+  findBuys' buys money i
+    | not (validCardId i) = []
+    | ccost i < money =
+      (map (i:) $ findBuys (buys - 1) (money - ccost i) (i+1)) ++ findBuys buys money (i+1)
+    | otherwise = findBuys' buys money (i+1)
+  ccost i = cost (idToCard i)
+
+-- Create a Move of buying a set of cards
+buyCards :: [CardId] -> Move
+buyCards cis = Move
+  ("Buy " <> T.intercalate ", " (map (name . idToCard) cis))
+  (mapM_ buyCard cis >> buys .= 0)
 
 -- Should I simulate the PlayAction behavior?
 simulate :: PlayAction ()
 simulate = ((||) <$> uses turn (==0) <*> view simulated) >>= guard
 
+-- Sample a list of values and their probabilities
+sample :: [(a, Double)] -> IO a
+sample [(x,_)] = return x
+sample xs = do
+  let s = sum (map snd xs)
+      cs = scanl1 (\(_,q) (y,s') -> (y, s'+q)) xs 
+  p <- randomRIO (0.0,s)
+  return . fst . head $ dropWhile (\(_,q) -> q < p) cs
+
 -- Choose the best playAction of the list to play, or mzero if null
 bestAction :: [PlayAction ()] -> PlayAction ()
-bestAction = undefined
+bestAction [] = mzero
+bestAction xs = StateT $ \s-> do
+  newStates <- mapM (flip execStateT s) xs
+  chosen <- liftIO $ sample $ map (\a-> (a, expectedScore a)) newStates
+  return ((), chosen)
+
+-- Reinforcement learning policy
+expectedScore :: GameState -> Double
+expectedScore = undefined
 
 -- Play out a turn for the program
 playTurn :: PlayAction ()
@@ -156,26 +195,36 @@ plusCard i = do
   replicateM_ i $ (use' (players.ix(tidx).deck) >>= liftIO . draw >>=
     \(i, d')-> players.ix(tidx).deck .= d' >> hand %= (idToCard i:))
 
+-- Add a card to the current player's discard pile
+buyCard :: CardId -> PlayAction ()
+buyCard i = do
+  tidx <- use turn
+  players.ix(tidx).deck %= addDiscard i
+
 -- Lookup a card by id
 idToCard :: CardId -> Card
 idToCard i = standardDeck V.! fromIntegral i
 
+-- Does this Word8 represent a valid card id?
+validCardId :: CardId -> Bool
+validCardId i = fromIntegral i < V.length standardDeck
+
 -- Base dominion deck (no expansions)
 standardDeck :: Vector Card
 standardDeck = [
-  (card "Copper" 0) {action = money += 1, cardType = Treasure},
-  (card "Silver" 3) {action = money += 2, cardType = Treasure},
-  (card "Gold" 6) {action = money += 3, cardType = Treasure},
-  (card "Estate" 2) {points = 1, cardType = Victory},
-  (card "Duchy" 5) {points = 3, cardType = Victory},
-  (card "Province" 8) {points = 6, cardType = Victory},
-  (card "Market" 2) {action = do {plusCard 1; buys += 1; money += 1}, more = 1},
-  (card "Laboratory" 4) {action = plusCard 2, more = 1},
-  (card "Militia" 4) {action = money += 2},
-  (card "Moat" 2) {action = plusCard 2, defense=True},
-  (card "Smithy" 3) {action = plusCard 3},
-  (card "Bureacrat" 4) {action = hand %= (fst (cardNames M.! "Silver") :)},
-  (card "Village" 5) {action = plusCard 1, more=1}]
+  (card "copper" 0) {action = money += 1, cardType = Treasure},
+  (card "silver" 3) {action = money += 2, cardType = Treasure},
+  (card "gold" 6) {action = money += 3, cardType = Treasure},
+  (card "estate" 2) {points = 1, cardType = Victory},
+  (card "duchy" 5) {points = 3, cardType = Victory},
+  (card "province" 8) {points = 6, cardType = Victory},
+  (card "market" 2) {action = do {plusCard 1; buys += 1; money += 1; actions += 1}},
+  (card "laboratory" 4) {action = plusCard 2 >> actions += 1},
+  (card "militia" 4) {action = money += 2},
+  (card "moat" 2) {action = plusCard 2, defense=True},
+  (card "smithy" 3) {action = plusCard 3},
+  (card "bureacrat" 4) {action = hand %= (fst (cardNames M.! "silver") :)},
+  (card "village" 5) {action = plusCard 1 >> actions +=1}]
 
 -- Index of deck by card name
 cardNames :: Map Text (Card, CardId)
