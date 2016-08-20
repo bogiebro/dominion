@@ -1,0 +1,6 @@
+This is a program to play the card game
+[Dominion](https://en.wikipedia.org/wiki/Dominion_(card_game)),
+using Q-learning. A physical dominion game is required.
+The program will prompt the users whenever it needs
+to draw from its deck, and will ask them to enter their moves. In response,
+the program will tell you its own moves. 
