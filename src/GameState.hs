@@ -2,7 +2,6 @@
 module GameState where
 import Control.Lens
 import Control.Monad.State.Strict
-import Control.Monad.Reader
 import Control.Monad.Trans.Maybe
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -23,10 +22,6 @@ import System.Random
 import System.Posix.Signals
 import Control.Concurrent
 import Data.IORef
-
-
--- WE SHOULD probably translate this to use reification
--- instead of implicit parameters
 
 -- Info for a single player
 data PlayerState = PlayerState {
@@ -57,7 +52,7 @@ type PlayAction = StateT GameState (StateT Weights GameAction)
 
 -- Dynamically scoped configuration variables
 type Config = (?turn :: Int, ?simulated :: Bool, ?myTurn :: Int,
-                ?updateWeights :: Bool, ?threads :: Int)
+               ?updateWeights :: Bool, ?threads :: Int)
 
 -- A move is a PlayAction, with a name for reporting it to the client
 -- It can either be playing a card, buying a card
@@ -89,7 +84,7 @@ card :: Text -> Word8 -> Card
 card n c = Card n (return ()) 0 c 0 Action False 10
 
 -- Lens into the current player's state
-player :: (?turn :: Int) => Lens' GameState PlayerState
+player :: (?turn :: Int, Applicative f) => LensLike' f GameState PlayerState
 player = players.ix(?turn)
 
 -- Which moves are legal for a given State?
@@ -181,14 +176,15 @@ sampleMove = do
   (m, st', _) <- liftIO $ sample ms (^._3)
   when ?updateWeights $ do
     nd <- notDone
-    (_, maxQ) <- lift $ fmap (maximumBy (comparing snd)) $ evalStateT weightedMoves st'
+    (_, _, maxQ) <- lift $ fmap (maximumBy (comparing (^._3))) $
+                      evalStateT weightedMoves st'
     train (if nd then maxQ else getScore st')
   doMove m 
 
 -- Execute the action encoded in a Move
 doMove :: Config => Move -> PlayAction ()
 doMove m = do
-  when (not ?simulated) $ T.putStrLn (moveName m)
+  when (not ?simulated) $ liftIO $ T.putStrLn (moveName m)
   moveAction m
 
 -- Play random games until the user says to stop; play the best move
@@ -228,7 +224,7 @@ expectedScore = undefined
 game :: Config => PlayAction Double
 game = do
   pl <- uses players V.length
-  forM (cycle [0..pl]) $ \t-> do
+  forM (drop ?turn $ cycle [0..pl]) $ \t-> do
     let ?turn = t
     plusCard 5
     actions .= 1
@@ -253,7 +249,7 @@ startState startDist pl = ini where
 -- Score a game
 getScore :: Config => GameState -> Double
 getScore g = fromIntegral (myScore - theirScore) where
-  myScore = g ^?! player.score
+  myScore = g ^?! players.ix(?myTurn).score
   theirScore = getMax (g ^. players.to(zeroMe).each.score.to Max)
   zeroMe = ix(?myTurn).score .~ 0
 

@@ -14,8 +14,10 @@ type CardId = Word8
 -- A probability distribution on cards, representing both deck and discard pile
 data Dist = Dist {
   _sample :: Vector CardId, -- set of cards present in the current deck
-  _discStart :: Int,        -- offset in 'sample' of discard pile's start
-  _discEnd :: Int          -- offset in 'sample' of discard pile's end
+  _rep :: Vector Word8, --tracks multiplicity of each card in the deck
+  _fresh :: Vector Word8, -- tracks multiplicity of each card including discards
+  _discStart :: Int, -- offset in 'sample' of discard pile's start
+  _discEnd :: Int -- offset in 'sample' of discard pile's end
 }
 
 makeLenses ''Dist
@@ -33,11 +35,13 @@ deckSize d = d^.discEnd
 
 -- Empty distribution 
 nullDist :: Dist
-nullDist = Dist (U.replicate totalCards 0) 0 0
+nullDist = Dist (U.replicate totalCards 0)
+  (U.replicate cardClasses 0) (U.replicate cardClasses 0) 0 0
 
 -- Add a card to the discard pile
 addDiscard :: CardId -> Dist -> Dist
-addDiscard i d = d & sample . ix (d ^. discEnd) .~ i
+addDiscard i d = d & fresh . ix (fromIntegral i) +~ 1
+                   & sample . ix (d ^. discEnd) .~ i
                    & discEnd +~ 1
 
 -- Make distribution in the discard pile
@@ -47,6 +51,7 @@ mkDist = L.foldl (\d (c, i)-> iterate (addDiscard c) d !! i) nullDist
 -- Shuffle a distribution, placing the discard pile back in the deck
 shuffle :: Dist -> Dist
 shuffle d = d & discStart .~ (d^.discEnd)
+              & rep .~ (d ^. fresh)
 
 -- Draw a card from this distribution.
 draw :: Dist -> IO (CardId, Dist)
@@ -59,8 +64,10 @@ discardIdx :: Dist -> Int -> (CardId, Dist)
 discardIdx d r = (i, d') where
   i = d^?!sample.ix(r)
   dst = d^.discStart - 1
-  d' = d & sample.ix(dst) .~ i & sample.ix(r) .~ (d^?!sample.ix(dst))
+  d' = d & sample.ix(dst) .~ i
+         & sample.ix(r) .~ (d^?!sample.ix(dst))
          & discStart -~ 1
+         & rep.ix(fromIntegral i) -~ 1
 
 -- Move this card from deck to discard. Takes O(n) time, but never used for simulation.
 discard :: CardId -> Dist  -> Dist
