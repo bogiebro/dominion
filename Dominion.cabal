@@ -2,20 +2,21 @@ name:                Dominion
 version:             0.1.0.0
 synopsis:            AI for the card game Dominion
 description:         Reinforcment learning meets crazy types
-homepage:            https://github.com/githubuser/Dominion#readme
+homepage:            https://github.com/bogiebro/dominion#readme
 license:             BSD3
 license-file:        LICENSE
-author:              Sam Anklesaria, Peter Nguyen
+author:              Sam Anklesaria
 maintainer:          amsay@amsay.net
 copyright:           2016 Yappy Dog Systems
 category:            Game
 build-type:          Simple
--- extra-source-files:
 cabal-version:       >=1.10
 
 library
   hs-source-dirs:      src
-  exposed-modules:     Dist, GameState, MonteCarlo, Train
+  exposed-modules:     Dist, GameState 
+  default-extensions:  TemplateHaskell, OverloadedLists, OverloadedStrings,
+                       ParallelListComp, ConstraintKinds, RankNTypes
   build-depends:       base >= 4.7 && < 5, transformers, lens,
                        random, text, vector, containers, mtl, unix, MemoTrie
   default-language:    Haskell2010
@@ -38,4 +39,4 @@ test-suite dominion-test
 
 source-repository head
   type:     git
-  location: https://github.com/githubuser/Dominion
+  location: https://github.com/bogiebro/dominion

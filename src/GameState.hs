@@ -1,4 +1,4 @@
-{-# LANGUAGE TemplateHaskell, ParallelListComp, OverloadedLists, OverloadedStrings #-}
+{-# LANGUAGE ImplicitParams, StrictData #-} 
 module GameState where
 import Control.Lens
 import Control.Monad.State.Strict
@@ -20,6 +20,13 @@ import Data.Word
 import Data.List
 import Data.Ord
 import System.Random
+import System.Posix.Signals
+import Control.Concurrent
+import Data.IORef
+
+
+-- WE SHOULD probably translate this to use reification
+-- instead of implicit parameters
 
 -- Info for a single player
 data PlayerState = PlayerState {
@@ -30,27 +37,27 @@ data PlayerState = PlayerState {
 
 -- Game state
 data GameState = GameState {
-  _players :: Vector PlayerState,
-  _remaining :: U.Vector Word8,
-  _needEliminated :: Int,
-  _money :: Word8,
-  _buys :: Word8,
-  _actions :: Word8,
-  _hand :: [Card],
-  _turn :: Int
+  _players :: Vector PlayerState, -- each player's deck and points
+  _remaining :: U.Vector Word8, -- cards left in inventory
+  _needEliminated :: Word8, -- number of piles to go before game end
+  _money :: Word8, -- amt of money remaining
+  _buys :: Word8, -- number of buys remaining
+  _actions :: Word8, -- number of actions remaining
+  _hand :: [Card] -- only includes action cards
 }
 
--- State affecting how we transition GameState
-data PlayState = PlayState {
-  _updateWeights :: Bool, 
-  _simulated :: Bool
-}
+-- Learned data
+type Weights = ()
 
 -- Gameplay component
-type GameAction = ReaderT PlayState (MaybeT IO)
+type GameAction = MaybeT IO
 
 -- Gameplay component, in a particular running context
-type PlayAction = StateT GameState GameAction
+type PlayAction = StateT GameState (StateT Weights GameAction)
+
+-- Dynamically scoped configuration variables
+type Config = (?turn :: Int, ?simulated :: Bool, ?myTurn :: Int,
+                ?updateWeights :: Bool, ?threads :: Int)
 
 -- A move is a PlayAction, with a name for reporting it to the client
 -- It can either be playing a card, buying a card
@@ -58,8 +65,6 @@ data Move = Move {
   moveName :: Text,
   moveAction :: PlayAction ()
 }
-instance Eq Move where (Move a _) == (Move b _) = a == b
-instance Ord Move where compare (Move a _) (Move b _) = compare a b
 
 -- Categories of cards, often for determining what's legal to draw
 data CardType = Victory | Treasure | Action deriving (Eq)
@@ -67,9 +72,10 @@ data CardType = Victory | Treasure | Action deriving (Eq)
 -- Properties of a card, regardless of CardType
 data Card = Card {
   name :: Text,
-  action :: PlayAction (),
+  action :: Config => PlayAction (),
   points :: Int,
   cost :: Word8,
+  more :: Word8,
   cardType :: CardType,
   defense :: Bool,
   initAmt :: Word8
@@ -77,14 +83,17 @@ data Card = Card {
 
 makeLenses ''PlayerState
 makeLenses ''GameState
-makeLenses ''PlayState
 
 -- Default card constructor
 card :: Text -> Word8 -> Card
-card n c = Card n (return ()) 0 c Action False 10
+card n c = Card n (return ()) 0 c 0 Action False 10
+
+-- Lens into the current player's state
+player :: (?turn :: Int) => Lens' GameState PlayerState
+player = players.ix(?turn)
 
 -- Which moves are legal for a given State?
-legalMoves :: GameState -> [Move]
+legalMoves :: Config => GameState -> [Move]
 legalMoves g =
   if _actions g > 0 then Move <$> (("Play " <>) . name) <*> action <$> _hand g
   else buyCards <$> findBuys (_buys g) (_money g) 0
@@ -97,68 +106,140 @@ findBuys = memo3 findBuys' where
     | not (validCardId i) = []
     | ccost i < money =
       (map (i:) $ findBuys (buys - 1) (money - ccost i) (i+1)) ++ findBuys buys money (i+1)
-    | otherwise = findBuys' buys money (i+1)
+    | otherwise = findBuys buys money (i+1)
   ccost i = cost (idToCard i)
 
 -- Create a Move of buying a set of cards
-buyCards :: [CardId] -> Move
+buyCards :: Config => [CardId] -> Move
 buyCards cis = Move
   ("Buy " <> T.intercalate ", " (map (name . idToCard) cis))
-  (mapM_ buyCard cis >> buys .= 0)
-
--- Should I simulate the PlayAction behavior?
-simulate :: PlayAction ()
-simulate = ((||) <$> uses turn (==0) <*> view simulated) >>= guard
+  (mapM_ addMyDiscard cis >> buys .= 0 >> money .= 0)
 
 -- Sample a list of values and their probabilities
-sample :: [(a, Double)] -> IO a
-sample [(x,_)] = return x
-sample xs = do
-  let s = sum (map snd xs)
-      cs = scanl1 (\(_,q) (y,s') -> (y, s'+q)) xs 
+sample :: [a] -> (a -> Double) -> IO a
+sample [x] _ = return x
+sample a@(x:xs) f = do
+  let s = sum (map f a)
+      cs = scanl (\(_,q) y-> (y, q + f y)) (x, f x)  xs
   p <- randomRIO (0.0,s)
   return . fst . head $ dropWhile (\(_,q) -> q < p) cs
 
--- Choose the best playAction of the list to play, or mzero if null
-bestAction :: [PlayAction ()] -> PlayAction ()
-bestAction [] = mzero
-bestAction xs = StateT $ \s-> do
-  newStates <- mapM (flip execStateT s) xs
-  chosen <- liftIO $ sample $ map (\a-> (a, expectedScore a)) newStates
-  return ((), chosen)
+-- Get possible moves, result states, and weights
+weightedMoves :: Config => PlayAction [(Move, GameState, Double)]
+weightedMoves = do
+  possible <- gets legalMoves
+  s <- get
+  w <- lift get
+  let ?simulate = True
+  states <- lift $ mapM (flip execStateT s . moveAction) possible
+  return $ zip3 possible states (map (expectedScore w) states)
 
--- Reinforcement learning policy
-expectedScore :: GameState -> Double
-expectedScore = undefined
+-- Check if a game is finished
+notDone :: PlayAction Bool
+notDone = do
+  allGone <- uses needEliminated (0 ==)
+  let provinceIdx = fromIntegral (snd (cardNames M.! "province"))
+  provincesGone <- uses remaining ((0 ==) . (U.! provinceIdx))
+  return (not (allGone || provincesGone))
+
+-- Play all moves that do not decrease the number of available actions
+playNoCostMoves :: Config => PlayAction ()
+playNoCostMoves = do
+  (nocost, others) <- uses hand (partition ((> 0) . more))
+  case nocost of
+    [] -> return ()
+    xs -> mapM_ action xs >> hand .= others >> playNoCostMoves
 
 -- Play out a turn for the program
-playTurn :: PlayAction ()
-playTurn = checkDone >> ((simulate >> simMove) `mplus` (liveAction >> liveBuy)) where
-  liveAction = do
-    t <- liftIO (T.putStrLn "Play a card:" >> T.getLine)
-    turnIdx <- use turn
-    when (not (T.null t)) $ do
-      (c, i) <- liftIO (parseCard t)
-      players.ix(turnIdx).deck %= discard i >> action c >> liveAction
-  liveBuy = do
-    t <- liftIO (T.putStrLn "Buy a card:" >> T.getLine)
-    turnIdx <- use turn
-    when (not (T.null t)) $ do
-      (_, i) <- liftIO (parseCard t)
-      players.ix(turnIdx).deck %= addDiscard i >> liveBuy
-  simMove = gets (fmap moveAction . legalMoves) >>= bestAction >> simMove
+playTurn :: Config => PlayAction ()
+playTurn =
+  notDone >>= guard >> if askUser then liveAction >> liveBuy else simMove where
+    liveAction = do
+      t <- liftIO (T.putStrLn "Play a card:" >> T.getLine)
+      when (not (T.null t)) $ do
+        (c, i) <- liftIO (parseCard t)
+        player.deck %= discard i >> action c >> liveAction
+    liveBuy = do
+      t <- liftIO (T.putStrLn "Buy a card:" >> T.getLine)
+      when (not (T.null t)) $ do
+        (_, i) <- liftIO (parseCard t)
+        player.deck %= addDiscard i >> liveBuy
+    simMove = playNoCostMoves >> makeMove >> simMove
+
+-- Should we ask the user how to make this move?
+askUser :: Config => Bool
+askUser = ?turn == ?myTurn || ?simulated
+
+-- Play a move (playing or buying a card)
+makeMove :: Config => PlayAction ()
+makeMove = if ?simulated then sampleMove else monteCarlo
+
+-- Sample a move according to weight and play it
+sampleMove :: Config => PlayAction ()
+sampleMove = do
+  ms <- weightedMoves
+  (m, st', _) <- liftIO $ sample ms (^._3)
+  when ?updateWeights $ do
+    nd <- notDone
+    (_, maxQ) <- lift $ fmap (maximumBy (comparing snd)) $ evalStateT weightedMoves st'
+    train (if nd then maxQ else getScore st')
+  doMove m 
+
+-- Execute the action encoded in a Move
+doMove :: Config => Move -> PlayAction ()
+doMove m = do
+  when (not ?simulated) $ T.putStrLn (moveName m)
+  moveAction m
+
+-- Play random games until the user says to stop; play the best move
+monteCarlo :: Config => PlayAction ()
+monteCarlo = do
+  ms <- gets legalMoves
+  join . fmap maxMove . forM ms $ \m@(Move n a)-> do
+    v <- liftIO $ newIORef (0, 0)
+    tids <- replicateM ?threads (forever (a >> game >>= liftIO . appendIt v))
+    liftIO $ do
+      awaitSignal (Just $ addSignal sigINT emptySignalSet)
+      mapM_ killThread tids
+      toAvg m <$> readIORef v
+
+-- Update the counter and score sum associated with a move
+appendIt :: IORef (Int, Double) -> Double -> IO ()
+appendIt ior upd =
+  atomicModifyIORef' ior (\(total, score)-> ((total+1, score+upd), ()))
+
+-- Calculate the average score per move
+toAvg :: Move -> (Int, Double) -> (Move, Double)
+toAvg m (total, score) = (m, score / fromIntegral total)
+
+-- Run the move with the best average score
+maxMove :: Config => [(Move, Double)] -> PlayAction ()
+maxMove = doMove . fst . maximumBy (comparing snd)
+
+-- Train the network based on the given y value
+train :: Double -> PlayAction ()
+train = undefined
+
+-- Reinforcement learning policy
+expectedScore :: Weights -> GameState -> Double
+expectedScore = undefined
 
 -- Play out a game, starting with the given cards available
-game :: PlayAction Int
+game :: Config => PlayAction Double
 game = do
-  pl <- uses players V.length 
-  forM (cycle [0..pl]) $ \t-> turn .= t >> playTurn
+  pl <- uses players V.length
+  forM (cycle [0..pl]) $ \t-> do
+    let ?turn = t
+    plusCard 5
+    actions .= 1
+    buys .= 1
+    playTurn
   gets getScore 
 
 -- Starting game state
-startState :: U.Vector CardId -> Int -> GameState
+startState :: U.Vector Word8 -> Int -> GameState
 startState startDist pl = ini where
-  startDeck = mkDist [(snd $ cardNames M.! "Copper", 7), (snd $ cardNames M.! "Estate", 3)]
+  startDeck = mkDist [(snd $ cardNames M.! "copper", 7), (snd $ cardNames M.! "estate", 3)]
   ini = GameState {
     _players = V.replicate pl (PlayerState startDeck 0 1),
     _remaining = startDist,
@@ -166,40 +247,40 @@ startState startDist pl = ini where
     _money = 0,
     _buys = 0,
     _actions = 0,
-    _hand = [],
-    _turn = 0
+    _hand = []
   }
 
 -- Score a game
-getScore :: GameState -> Int
-getScore g = myScore - theirScore where
-  myScore = g ^?! players.ix(0).score
-  theirScore = getMax (g ^. dropping 1 players.each.score.to Max)
+getScore :: Config => GameState -> Double
+getScore g = fromIntegral (myScore - theirScore) where
+  myScore = g ^?! player.score
+  theirScore = getMax (g ^. players.to(zeroMe).each.score.to Max)
+  zeroMe = ix(?myTurn).score .~ 0
+
+-- Put a card into your hand
+handleDraw :: Config => Card -> PlayAction ()
+handleDraw c = case cardType c of
+  Action -> hand %= (c:)
+  Victory -> return ()
+  Treasure -> action c
+
+-- Add a card to your hand
+addHand :: Config => CardId -> PlayAction ()
+addHand c = addMyDiscard c >> handleDraw (idToCard c)
 
 -- Unsafe version of use
 use' :: MonadState s m => Getting (Endo a) s a -> m a
 use' f = gets (^?! f)
 
--- Check if a game is finished
-checkDone :: PlayAction ()
-checkDone = do
-  allGone <- uses needEliminated (0 ==)
-  let provinceIdx = fromIntegral (snd (cardNames M.! "Province"))
-  provincesGone <- uses remaining ((0 ==) . (U.! provinceIdx))
-  guard (allGone || provincesGone)
-
--- Move `i` cards from deck to hand
-plusCard :: Int -> PlayAction ()
-plusCard i = do
-  tidx <- use turn
-  replicateM_ i $ (use' (players.ix(tidx).deck) >>= liftIO . draw >>=
-    \(i, d')-> players.ix(tidx).deck .= d' >> hand %= (idToCard i:))
+-- Move `i` cards from deck to hand, discarding victories and applying treasure
+plusCard :: Config => Int -> PlayAction ()
+plusCard i =
+  replicateM_ i $ (use' (player.deck) >>= liftIO . draw >>=
+    \(i, d')-> player.deck .= d' >> handleDraw (idToCard i))
 
 -- Add a card to the current player's discard pile
-buyCard :: CardId -> PlayAction ()
-buyCard i = do
-  tidx <- use turn
-  players.ix(tidx).deck %= addDiscard i
+addMyDiscard :: Config => CardId -> PlayAction ()
+addMyDiscard i = player.deck %= addDiscard i
 
 -- Lookup a card by id
 idToCard :: CardId -> Card
@@ -218,13 +299,13 @@ standardDeck = [
   (card "estate" 2) {points = 1, cardType = Victory},
   (card "duchy" 5) {points = 3, cardType = Victory},
   (card "province" 8) {points = 6, cardType = Victory},
-  (card "market" 2) {action = do {plusCard 1; buys += 1; money += 1; actions += 1}},
-  (card "laboratory" 4) {action = plusCard 2 >> actions += 1},
+  (card "market" 2) {more = 1, action = do {plusCard 1; buys += 1; money += 1}},
+  (card "laboratory" 4) {more = 1, action = plusCard 2},
   (card "militia" 4) {action = money += 2},
   (card "moat" 2) {action = plusCard 2, defense=True},
   (card "smithy" 3) {action = plusCard 3},
-  (card "bureacrat" 4) {action = hand %= (fst (cardNames M.! "silver") :)},
-  (card "village" 5) {action = plusCard 1 >> actions +=1}]
+  (card "bureacrat" 4) {action = addHand (snd (cardNames M.! "silver"))},
+  (card "village" 5) {more = 1, action = plusCard 1}]
 
 -- Index of deck by card name
 cardNames :: Map Text (Card, CardId)
