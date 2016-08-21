@@ -187,17 +187,24 @@ doMove m = do
   when (not ?simulated) $ liftIO $ T.putStrLn (moveName m)
   moveAction m
 
+-- Execute the action infinitely on a pool of workers
+workers :: (?threads::Int) => IO () -> IO ()
+workers m = do
+  tids <- replicateM ?threads (forkIO (forever m))
+  awaitSignal (Just $ addSignal sigINT emptySignalSet)
+  mapM_ killThread tids
+
 -- Play random games until the user says to stop; play the best move
 monteCarlo :: Config => PlayAction ()
 monteCarlo = do
   ms <- gets legalMoves
-  join . fmap maxMove . forM ms $ \m@(Move n a)-> do
-    v <- liftIO $ newIORef (0, 0)
-    tids <- replicateM ?threads (forever (a >> game >>= liftIO . appendIt v))
-    liftIO $ do
-      awaitSignal (Just $ addSignal sigINT emptySignalSet)
-      mapM_ killThread tids
-      toAvg m <$> readIORef v
+  s <- get
+  w <- lift get
+  join . liftIO . fmap maxMove . forM ms $ \m@(Move n a)-> do
+    v <- newIORef (0, 0)
+    workers $ runMaybeT (execStateT (execStateT
+      (a >> game >>= liftIO . appendIt v) s) w) >> return ()
+    toAvg m <$> readIORef v
 
 -- Update the counter and score sum associated with a move
 appendIt :: IORef (Int, Double) -> Double -> IO ()
@@ -233,9 +240,10 @@ game = do
   gets getScore 
 
 -- Starting game state
-startState :: U.Vector Word8 -> Int -> GameState
-startState startDist pl = ini where
-  startDeck = mkDist [(snd $ cardNames M.! "copper", 7), (snd $ cardNames M.! "estate", 3)]
+startState :: Int -> U.Vector Word8 -> GameState
+startState pl startDist = ini where
+  startDeck = mkDist (V.length standardDeck) 100
+    [(snd $ cardNames M.! "copper", 7), (snd $ cardNames M.! "estate", 3)]
   ini = GameState {
     _players = V.replicate pl (PlayerState startDeck 0 1),
     _remaining = startDist,

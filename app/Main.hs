@@ -10,6 +10,11 @@ import GameState
 import Control.Monad.Trans.Maybe
 import Control.Monad.State.Strict
 import Data.Word
+import Dist
+import qualified Data.IntMap as I
+import Data.IntMap (IntMap)
+import Control.Lens
+import System.Random
 
 data Opts = Opts FilePath Int Int Int Bool (U.Vector Word8)
 
@@ -35,23 +40,30 @@ parseCards =
       useCard b c = if b then initAmt c else 0
   in fmap U.fromList $ zipWith useCard <$> fmap (replicate 6 True <>) cs <*> pure std
 
-
 readWeights :: FilePath -> IO Weights
 readWeights = undefined
 
--- repeat infinitely until sigINT
--- pick 12 cards to make your (Vector Word8)
--- play a full game
+-- Pick 12 random card classes to start the game
+dealIt :: IO [CardId]
+dealIt = fmap (snd . mapAccumL f I.empty) rs where
+  rs = mapM (\l-> (l,) <$> randomRIO (0,l)) [lastCard .. lastCard - 12]
+  f :: IntMap Int -> (Int, Int) -> (IntMap Int, CardId)
+  f a (l, i) = (a & at(i) ?~ maybe l id (a^?ix(l)),
+                maybe (fromIntegral i) fromIntegral (a^?ix(i)))
+  lastCard = V.length standardDeck - 1
+
+randState :: IO (U.Vector Word8)
+randState = foldl (\v i-> v & ix(fromIntegral i) .~ initAmt (idToCard i))
+  (U.replicate (V.length standardDeck) 0) <$> dealIt
 
 handle :: Opts -> IO ()
-handle (Opts trainPath players threads t True _) = undefined
-handle (Opts trainPath players threads t False cards) =
+handle (Opts trainPath players threads t sim cards) = do
+  w <- readWeights trainPath
   let ?threads = threads
       ?myTurn = t
       ?updateWeights = False
-      ?simulated = False
+      ?simulated = sim
       ?turn = 0
-  in do
-    w <- readWeights trainPath
-    _ <- runMaybeT $ execStateT (execStateT game (startState cards players)) w
-    T.putStrLn "Game Over"
+  st <- if sim then startState players <$> randState else return (startState players cards)
+  let m = runMaybeT (execStateT (execStateT game st) w) >> return ()
+  if sim then workers m else m

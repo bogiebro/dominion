@@ -22,20 +22,12 @@ data Dist = Dist {
 
 makeLenses ''Dist
 
--- Constant for number of types of cards 
-cardClasses :: Int
-cardClasses = 25
-
--- Constant for total number of cards that can fit in a deck
-totalCards :: Int
-totalCards = 200
-
 deckSize :: Dist -> Int
 deckSize d = d^.discEnd
 
 -- Empty distribution 
-nullDist :: Dist
-nullDist = Dist (U.replicate totalCards 0)
+nullDist :: Int -> Int -> Dist
+nullDist cardClasses totalCards = Dist (U.replicate totalCards 0)
   (U.replicate cardClasses 0) (U.replicate cardClasses 0) 0 0
 
 -- Add a card to the discard pile
@@ -45,8 +37,9 @@ addDiscard i d = d & fresh . ix (fromIntegral i) +~ 1
                    & discEnd +~ 1
 
 -- Make distribution in the discard pile
-mkDist :: [(CardId, Int)] -> Dist
-mkDist = L.foldl (\d (c, i)-> iterate (addDiscard c) d !! i) nullDist
+mkDist :: Int -> Int -> [(CardId, Int)] -> Dist
+mkDist classes total =
+  L.foldl (\d (c, i)-> iterate (addDiscard c) d !! i) (nullDist classes total)
 
 -- Shuffle a distribution, placing the discard pile back in the deck
 shuffle :: Dist -> Dist
