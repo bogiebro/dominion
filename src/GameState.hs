@@ -38,17 +38,19 @@ data GameState = GameState {
   _money :: Word8, -- amt of money remaining
   _buys :: Word8, -- number of buys remaining
   _actions :: Word8, -- number of actions remaining
-  _hand :: [Card] -- only includes action cards
+  _hand :: [Card], -- only includes action cards
+  _turn :: Int
 }
 
 -- Learned data
 type Weights = ()
 
 -- Gameplay component
-type GameAction = MaybeT IO
-
--- Gameplay component, in a particular running context
-type PlayAction = StateT GameState (StateT Weights GameAction)
+-- PROBLEM- we're using t for reading only
+-- But we'll have to update t every time, right? Check. 
+-- If not, we can take out Weights too.
+newtype PlayAction t a = PA (StateT (GameState t) (StateT Weights (MaybeT IO)) a)
+  deriving (Monad, MonadIO, MonadState GameState, MonadState Weights)
 
 -- Dynamically scoped configuration variables
 type Config = (?turn :: Int, ?simulated :: Bool, ?myTurn :: Int,
@@ -84,11 +86,11 @@ card :: Text -> Word8 -> Card
 card n c = Card n (return ()) 0 c 0 Action False 10
 
 -- Lens into the current player's state
-player :: (?turn :: Int, Applicative f) => LensLike' f GameState PlayerState
-player = players.ix(?turn)
+player :: Applicative f => Int -> LensLike' f (GameState t) PlayerState
+player = players.ix(reflect (Proxy :: t))
 
 -- Which moves are legal for a given State?
-legalMoves :: Config => GameState -> [Move]
+legalMoves :: GameState -> [Move]
 legalMoves g =
   if _actions g > 0 then Move <$> (("Play " <>) . name) <*> action <$> _hand g
   else buyCards <$> findBuys (_buys g) (_money g) 0
@@ -105,7 +107,7 @@ findBuys = memo3 findBuys' where
   ccost i = cost (idToCard i)
 
 -- Create a Move of buying a set of cards
-buyCards :: Config => [CardId] -> Move
+buyCards :: [CardId] -> Move
 buyCards cis = Move
   ("Buy " <> T.intercalate ", " (map (name . idToCard) cis))
   (mapM_ addMyDiscard cis >> buys .= 0 >> money .= 0)
@@ -146,19 +148,19 @@ playNoCostMoves = do
     xs -> mapM_ action xs >> hand .= others >> playNoCostMoves
 
 -- Play out a turn for the program
-playTurn :: Config => PlayAction ()
-playTurn =
+playTurn :: Int -> PlayAction ()
+playTurn t =
   notDone >>= guard >> if askUser then liveAction >> liveBuy else simMove where
     liveAction = do
-      t <- liftIO (T.putStrLn "Play a card:" >> T.getLine)
-      when (not (T.null t)) $ do
-        (c, i) <- liftIO (parseCard t)
-        player.deck %= discard i >> action c >> liveAction
+      u <- liftIO (T.putStrLn "Play a card:" >> T.getLine)
+      when (not (T.null u)) $ do
+        (c, i) <- liftIO (parseCard u)
+        players.ix(t).deck %= discard i >> action c >> liveAction
     liveBuy = do
-      t <- liftIO (T.putStrLn "Buy a card:" >> T.getLine)
-      when (not (T.null t)) $ do
-        (_, i) <- liftIO (parseCard t)
-        player.deck %= addDiscard i >> liveBuy
+      u <- liftIO (T.putStrLn "Buy a card:" >> T.getLine)
+      when (not (T.null u)) $ do
+        (_, i) <- liftIO (parseCard u)
+        players.ix(t).deck %= addDiscard i >> liveBuy
     simMove = playNoCostMoves >> makeMove >> simMove
 
 -- Should we ask the user how to make this move?
@@ -219,6 +221,20 @@ toAvg m (total, score) = (m, score / fromIntegral total)
 maxMove :: Config => [(Move, Double)] -> PlayAction ()
 maxMove = doMove . fst . maximumBy (comparing snd)
 
+-- HERE WE GO
+-- Problem already: size depends on length of standardDeck
+-- The number of players will be fixed at two- the computer,
+-- and an opponent. We can just run it separately for
+-- each opponent.
+-- How do we approach the 'hand'. Do we just use a distribution,
+-- like the 'discard' and 'deck'? Yep.
+model :: StdModel (N.Vector 60) Identity GameState Double
+model = mkStdModel net getErr inject runIdentity where
+  getErr x = Diff $ sq . liftA2 subtract (pure $ fromDouble x)
+  sq x = x * x 
+  net = linearLayer . reLULayer . reLULayer 
+
+
 -- Train the network based on the given y value
 train :: Double -> PlayAction ()
 train = undefined
@@ -269,21 +285,17 @@ handleDraw c = case cardType c of
   Treasure -> action c
 
 -- Add a card to your hand
-addHand :: Config => CardId -> PlayAction ()
+addHand :: CardId -> PlayAction t ()
 addHand c = addMyDiscard c >> handleDraw (idToCard c)
 
--- Unsafe version of use
-use' :: MonadState s m => Getting (Endo a) s a -> m a
-use' f = gets (^?! f)
-
 -- Move `i` cards from deck to hand, discarding victories and applying treasure
-plusCard :: Config => Int -> PlayAction ()
+plusCard :: Int -> PlayAction t ()
 plusCard i =
-  replicateM_ i $ (use' (player.deck) >>= liftIO . draw >>=
+  replicateM_ i $ (gets (^?! player.deck) >>= liftIO . draw >>=
     \(i, d')-> player.deck .= d' >> handleDraw (idToCard i))
 
 -- Add a card to the current player's discard pile
-addMyDiscard :: Config => CardId -> PlayAction ()
+addMyDiscard :: CardId -> PlayAction t ()
 addMyDiscard i = player.deck %= addDiscard i
 
 -- Lookup a card by id
